@@ -1,6 +1,6 @@
 --- a/src/nvidia/src/kernel/gpu/gpu_gspclient.c
 +++ b/src/nvidia/src/kernel/gpu/gpu_gspclient.c
-@@ -292,10 +292,21 @@ gpuGetNameString_FWCLIENT
+@@ -292,10 +292,21 @@
  )
  {
      GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
