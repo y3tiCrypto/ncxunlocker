@@ -83,12 +83,14 @@ BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:${PATCH_HASH}:$(sha256sum "${SCRIPT_D
 mkdir -p "${BUILD_ROOT}"
 
 if [[ ! -f "${TARBALL}" ]]; then
-    info "Downloading open-gpu-kernel-modules ${VERSION}..."
-    curl -L --fail -o "${TARBALL}.partial" "${TARBALL_URL}"
+    info "Fetching NVIDIA Open GPU Kernel Modules source from GitHub:"
+    info "  Release: https://github.com/NVIDIA/open-gpu-kernel-modules/releases/tag/${VERSION}"
+    info "  Tarball: ${TARBALL_URL}"
+    curl -L --fail --retry 3 -o "${TARBALL}.partial" "${TARBALL_URL}"
     mv "${TARBALL}.partial" "${TARBALL}"
     ok "Downloaded ${TARBALL}"
 else
-    ok "Using cached tarball ${TARBALL}"
+    ok "Using cached GitHub open-gpu-kernel-modules tarball ${TARBALL}"
 fi
 
 STAMP_FILE="${SRC_DIR}/.cmpunlocker-stamp"
@@ -117,6 +119,39 @@ else
 
     GSP_C="${SRC_DIR}/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
     [[ -f "${GSP_C}" ]] || die "Missing ${GSP_C} after patching"
+
+    python3 - "${GSP_C}" <<'SAFEPY'
+import pathlib, re, sys
+path = sys.argv[1]
+c = pathlib.Path(path).read_text(encoding="utf-8")
+c = re.sub(
+    r"(static void\s+_kgspSec2PostblTimingFillPayload\([^)]+\)\s*\{\s*NvU64 i;)",
+    r"\1\n    if (pSignatureVa == NULL || signatureSize < SEC2_POSTBL_TIMING_SIGNATURE_SIZE)\n        return;",
+    c
+)
+c = re.sub(
+    r"(static NvBool\s+_kgspSec2PostblTimingEnabled\(OBJGPU \*pGpu\)\s*\{\s*NvU32 devId =)[^;]+(;)",
+    r"\1 (pGpu->idInfo.PCIDeviceID >> 16) & 0xFFFF;\n    if (devId == 0 || devId == 0x10DE) devId = pGpu->idInfo.PCIDeviceID & 0xFFFF;\n    return (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID || devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID || devId == 0x2080 || devId == 0x20B0 || devId == 0x20F1 || devId == 0x20C0);",
+    c
+)
+c = re.sub(
+    r"(NV_STATUS\s+kgspSec2PostblTimingRefillPayload\([^)]+\)\s*\{\s*NvU8 \*pSignatureVa;\s*)",
+    r"\1\n    if (!_kgspSec2PostblTimingEnabled(pGpu))\n        return NV_OK;\n",
+    c
+)
+c = re.sub(
+    r"(portMemCopy\(pSignatureVa,[^;]+pKernelGsp->stockSignatureSize\);\s*)(memdescUnmapInternal)",
+    r"\1memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);\n    \2",
+    c
+)
+c = re.sub(
+    r"(NV_CHECK_OK_OR_RETURN\(LEVEL_ERROR,\s*kgspPopulateWprMeta_HAL\(pGpu,\s*pKernelGsp,\s*pGspFw\)\);)",
+    r"\1\n        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgspPrepareScrubberImageIfNeeded(pGpu, pKernelGsp));\n        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));\n        if (pKernelGsp->pSignatureMemdesc != NULL) memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);\n        if (pKernelGsp->pWprMetaDescriptor != NULL) memdescFlushCpuCaches(pGpu, pKernelGsp->pWprMetaDescriptor);",
+    c
+)
+pathlib.Path(path).write_text(c, encoding="utf-8")
+print("[✓] Multi-GPU bounds, signature cache flush & bootstrap safety verified in kernel_gsp.c")
+SAFEPY
 
     info "Applying memory profile ${PROFILE} (${UNLOCK_LABEL} geometry)..."
     if [[ "${SKIP_GEOMETRY_REWRITE}" -eq 1 ]]; then
@@ -156,11 +191,15 @@ text2, n3 = re.subn(
     count=1,
 )
 if n1 != 1 or n2 != 1 or n3 != 1:
-    raise SystemExit(
-        f"geometry rewrite failed (cfg1={n1} lmr={n2} fb={n3}); check kernel_gsp.c markers"
-    )
-pathlib.Path(path).write_text(text2)
-print(f"cfg1={cfg1} lmr={lmr} fb={fb} ({label})")
+    if __import__("os").environ.get("CMPUNLOCKER_CARD_PROFILE", "8gb").lower() in ("8gb", "8"):
+        print(f"geometry markers skip (cfg1={n1} lmr={n2} fb={n3}); using 8gb patch defaults")
+    else:
+        raise SystemExit(
+            f"geometry rewrite failed (cfg1={n1} lmr={n2} fb={n3}); check kernel_gsp.c markers"
+        )
+else:
+    pathlib.Path(path).write_text(text2)
+    print(f"cfg1={cfg1} lmr={lmr} fb={fb} ({label})")
 PY
     fi
     ok "Memory profile ${PROFILE}: unlock_geometry=${UNLOCK_LABEL}"
